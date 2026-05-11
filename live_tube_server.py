@@ -87,10 +87,12 @@ TRAIN_MODELS = {
     "Waterloo & City":    {"model": "1992 Stock",  "manufacturer": "ABB / BREL"},
 }
 
-# ÔöÇÔöÇ Globals ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── Globals ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-cached_tracks       = {}
+cached_tracks       = {}      # lineName -> [[lat,lon],...]  (station-based, for interpolation)
+cached_tracks_geo   = {}      # GeoJSON FeatureCollection    (real geometry, for map rendering)
+line_track_coords   = {}      # lineName -> [[lon,lat],...] merged track coords (for snapping)
 cached_stations     = []
 station_lookup      = {}
 line_stations_ord   = {}
@@ -148,10 +150,10 @@ def order_stations_nn(stations):
 # Static Data  (stations + tracks via TfL API)
 # ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
 def load_static_data():
-    global cached_tracks, cached_stations, station_lookup
+    global cached_tracks, cached_tracks_geo, cached_stations, station_lookup
     global line_stations_ord, station_index
 
-    print("­ƒôí Loading stations from TfL API ÔÇª")
+    print("\U0001f4cd Loading stations from TfL API \u2026")
     all_stations = {}
 
     for line_name, slug in LINE_SLUGS.items():
@@ -161,57 +163,230 @@ def load_static_data():
             for s in stops:
                 lat, lon = s.get("lat"), s.get("lon")
                 if lat and lon:
-                    stn = {
-                        "naptanId": s["naptanId"],
-                        "StationName": s.get("commonName", ""),
-                        "lat": lat,
-                        "lon": lon,
-                    }
+                    nap = s["naptanId"]
+                    if nap in all_stations:
+                        if line_name not in all_stations[nap].get("lines", []):
+                            all_stations[nap].setdefault("lines", []).append(line_name)
+                        stn = all_stations[nap]
+                    else:
+                        stn = {
+                            "naptanId": nap,
+                            "StationName": s.get("commonName", ""),
+                            "lat": lat,
+                            "lon": lon,
+                            "lines": [line_name],
+                        }
+                        all_stations[nap] = stn
                     stns.append(stn)
-                    all_stations[s["naptanId"]] = stn
 
             ordered = order_stations_nn(stns)
             line_stations_ord[line_name] = ordered
-            cached_tracks[line_name] = [[s["lat"], s["lon"]] for s in ordered]
+            center = [[s["lat"], s["lon"]] for s in ordered]
+            cached_tracks[line_name] = center
 
             for i, s in enumerate(ordered):
                 station_index[(line_name, s["naptanId"])] = i
 
         except Exception as e:
-            print(f"   ÔÜá {line_name}: {e}")
+            print(f"   \u26a1 {line_name}: {e}")
 
     cached_stations = list(all_stations.values())
     station_lookup = all_stations
 
     total_pts = sum(len(v) for v in cached_tracks.values())
-    print(f"   Ô£à {len(cached_stations)} stations | "
+    print(f"   \u2713 {len(cached_stations)} stations | "
           f"{len(cached_tracks)} lines | {total_pts} track points (NN ordered)")
+
+    # ── Fetch real track geometry from TfL Route/Sequence API ──
+    print("\U0001f6e4  Loading route geometry \u2026")
+
+    def _catmull_rom_smooth(coords, subdivisions=4):
+        """Centripetal Catmull-Rom spline for smoother track curves."""
+        if len(coords) < 3:
+            return coords
+        pts = [coords[0]] + coords + [coords[-1]]  # ghost endpoints
+        out = []
+        for i in range(1, len(pts) - 2):
+            p0, p1, p2, p3 = pts[i-1], pts[i], pts[i+1], pts[i+2]
+            for t_idx in range(subdivisions):
+                t = t_idx / subdivisions
+                t2, t3 = t*t, t*t*t
+                x = 0.5*((-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3
+                         +(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2
+                         +(-p0[0]+p2[0])*t + 2*p1[0])
+                y = 0.5*((-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3
+                         +(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2
+                         +(-p0[1]+p2[1])*t + 2*p1[1])
+                out.append([round(x, 6), round(y, 6)])
+        out.append(coords[-1])
+        return out
+
+    def _seg_length(coords):
+        """Geographic length of a segment (sum of Euclidean deltas)."""
+        d = 0
+        for i in range(1, len(coords)):
+            dx = coords[i][0] - coords[i-1][0]
+            dy = coords[i][1] - coords[i-1][1]
+            d += (dx*dx + dy*dy) ** 0.5
+        return d
+
+    MIN_SEGMENT_PTS = 10          # drop stray stubs (< 10 raw points)
+    MIN_SEGMENT_LEN = 0.05        # ~5.5 km at London latitude
+
+    # Real London Tube map: number of unique route geometries per line.
+    # TfL returns every (western branch × eastern branch) combination,
+    # creating many duplicate/subset segments.  We keep only the N longest
+    # after de-duplicating exact (start,end) pairs.
+    EXPECTED_BRANCHES = {
+        "Bakerloo":           1,   # Elephant & Castle → Harrow & Wealdstone
+        "Central":            2,   # West Ruislip → Epping | Woodford
+        "Circle":             1,   # Hammersmith loop → Edgware Road
+        "District":           3,   # Ealing Bwy / Richmond / Wimbledon → Upminster
+        "Hammersmith & City": 1,   # Hammersmith → Barking
+        "Jubilee":            1,   # Stanmore → Stratford
+        "Metropolitan":       4,   # Chesham / Amersham / Watford / Uxbridge → Aldgate
+        "Northern":           4,   # Morden → High Barnet / Edgware / Mill Hill East + Battersea extension
+        "Piccadilly":         3,   # Uxbridge / Heathrow T5 / T4 → Cockfosters
+        "Victoria":           1,   # Brixton → Walthamstow Central
+        "Waterloo & City":    1,   # Waterloo → Bank
+    }
+
+    def _pt_dist(a, b):
+        return ((a[0]-b[0])**2 + (a[1]-b[1])**2) ** 0.5
+
+    def _merge_line_segments(all_segs, max_branches):
+        """Remove duplicate and subset segments, keep only unique branches.
+        Step 1: dedup by (start,end) pair — keep longest for each pair.
+        Step 2: keep the top N longest (matching the real tube map branch count).
+        """
+        if len(all_segs) <= 1:
+            return all_segs
+
+        EP_TOL = 0.002   # ~220m — same endpoint
+
+        # Step 1: Dedup by (start, end) pair
+        groups = {}
+        for seg in all_segs:
+            sk, ek = tuple(seg[0]), tuple(seg[-1])
+            matched_key = None
+            for key in groups:
+                ks, ke = key
+                if _pt_dist(sk, ks) < EP_TOL and _pt_dist(ek, ke) < EP_TOL:
+                    matched_key = key
+                    break
+            if matched_key:
+                if len(seg) > len(groups[matched_key]):
+                    groups[matched_key] = seg
+            else:
+                groups[(sk, ek)] = seg
+        deduped = list(groups.values())
+
+        # Step 2: Keep only the N longest segments (real tube map branches)
+        deduped.sort(key=len, reverse=True)
+        return deduped[:max_branches]
+
+    features = []
+    geo_pts = 0
+    skipped = 0
+    merged_away = 0
+    for line_name, slug in LINE_SLUGS.items():
+        color = LINE_COLORS.get(line_name, "#999")
+        is_short_line = slug == "waterloo-city"   # only 2 stations
+        try:
+            seq = tfl_get(f"/Line/{slug}/Route/Sequence/outbound")
+            # Collect all raw segments for this line
+            raw_segs = []
+            for ls_raw in seq.get("lineStrings", []):
+                parsed = json.loads(ls_raw) if isinstance(ls_raw, str) else ls_raw
+                # TfL wraps coordinates: [[[lon,lat],[lon,lat],...]] — unwrap
+                if (parsed and isinstance(parsed[0], list)
+                        and len(parsed[0]) > 0
+                        and isinstance(parsed[0][0], list)):
+                    sub_paths = parsed          # list of coord arrays
+                else:
+                    sub_paths = [parsed]         # already flat
+                for coords in sub_paths:
+                    if len(coords) >= 2:
+                        raw_segs.append(coords)
+
+            # Merge: remove duplicates & subsets, keep unique branches
+            before = len(raw_segs)
+            max_br = EXPECTED_BRANCHES.get(line_name, 1)
+            merged = _merge_line_segments(raw_segs, max_br)
+            removed = before - len(merged)
+            merged_away += removed
+            if removed:
+                print(f"      {line_name}: {before} → {len(merged)} segments"
+                      f" ({removed} removed)")
+
+            for coords in merged:
+                # Filter out short stray stubs (exempt Waterloo & City)
+                if not is_short_line:
+                    if len(coords) < MIN_SEGMENT_PTS or _seg_length(coords) < MIN_SEGMENT_LEN:
+                        skipped += 1
+                        continue
+                # Smooth with Catmull-Rom spline
+                smooth = _catmull_rom_smooth(coords, subdivisions=8)
+                features.append({
+                    "type": "Feature",
+                    "properties": {"lineName": line_name, "color": color},
+                    "geometry": {"type": "LineString", "coordinates": smooth},
+                })
+                geo_pts += len(smooth)
+        except Exception as e:
+            print(f"   \u26a1 Route {line_name}: {e}")
+
+    cached_tracks_geo = {"type": "FeatureCollection", "features": features}
+    print(f"   \u2713 {len(features)} route segments | {geo_pts} geometry points"
+          f" (merged {merged_away} dupes/subsets, skipped {skipped} stubs)")
+
+    # ── Build per-line merged coordinate list for train snapping ──
+    global line_track_coords
+    line_track_coords = {}
+    for feat in features:
+        ln = feat["properties"]["lineName"]
+        line_track_coords.setdefault(ln, []).extend(feat["geometry"]["coordinates"])
 
 
 # ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
 # Live Trains  (TfL Arrivals API)
 # ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
+PLACEHOLDER_VIDS = {"000", "", "0"}
+
+
 def fetch_live_trains():
     all_slugs = ",".join(LINE_SLUGS.values())
     arrivals = tfl_get(f"/Line/{all_slugs}/Arrivals")
 
-    # Keep nearest arrival (smallest timeToStation) per vehicle
-    by_vid = {}
+    # Keep nearest arrival (smallest timeToStation) per vehicle.
+    # Some lines (e.g. Northern) return vehicleId="000" for every record.
+    # For those, use naptanId+towards as the dedup key so each
+    # station/direction pair becomes a separate train on the map.
+    by_key = {}
     for a in arrivals:
-        vid = a.get("vehicleId")
-        if not vid:
-            continue
+        vid = a.get("vehicleId", "")
+        line = a.get("lineName", "")
+        if vid in PLACEHOLDER_VIDS:
+            key = f"_syn_{line}_{a.get('naptanId','')}_{a.get('towards','')}"
+        else:
+            key = f"{line}_{vid}"
         tts = a.get("timeToStation", 9999)
-        if vid not in by_vid or tts < by_vid[vid].get("timeToStation", 9999):
-            by_vid[vid] = a
+        if key not in by_key or tts < by_key[key].get("timeToStation", 9999):
+            by_key[key] = a
+            by_key[key]["_resolved_vid"] = key
 
     trains = []
-    for a in by_vid.values():
+    for a in by_key.values():
         nap = a.get("naptanId", "")
         stn = station_lookup.get(nap, {})
+        vid = a.get("vehicleId", "")
+        line = a.get("lineName", "")
+        # trainKey must be unique across all lines (vehicleIds collide cross-line)
+        train_key = a.get("_resolved_vid", f"{line}_{vid}")
         trains.append({
-            "vehicleId": a.get("vehicleId", ""),
-            "lineName":  a.get("lineName", ""),
+            "vehicleId": vid,
+            "trainKey":  train_key,
+            "lineName":  line,
             "naptanId":  nap,
             "stationName": a.get("stationName", ""),
             "direction": a.get("direction", ""),
@@ -225,11 +400,41 @@ def fetch_live_trains():
     return trains
 
 
-# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
+# ═══════════════════════════════════════════════════════════════════════════════
+# Snap to Track  (project point onto nearest track segment)
+# ═══════════════════════════════════════════════════════════════════════════════
+def snap_to_track_line(lon, lat, line_name):
+    """Snap a (lon, lat) point to the closest position on the track geometry."""
+    coords = line_track_coords.get(line_name)
+    if not coords or len(coords) < 2:
+        return lon, lat
+    best_d2 = float('inf')
+    best_pt = (lon, lat)
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i]
+        bx, by = coords[i + 1]
+        dx, dy = bx - ax, by - ay
+        len2 = dx * dx + dy * dy
+        if len2 < 1e-14:
+            continue
+        t = max(0.0, min(1.0, ((lon - ax) * dx + (lat - ay) * dy) / len2))
+        px, py = ax + t * dx, ay + t * dy
+        d2 = (lon - px) ** 2 + (lat - py) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best_pt = (px, py)
+    return best_pt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Position Interpolation  (direction-aware)
-# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
+# ═══════════════════════════════════════════════════════════════════════════════
+_prev_emit = {}   # trainKey -> (lon, lat, naptanId)  — forward-only cache
+
 def interpolate_trains(raw, elapsed_s):
+    global _prev_emit
     out = []
+    active_keys = set()
     for t in raw:
         line   = t["lineName"]
         naptan = t["naptanId"]
@@ -240,7 +445,7 @@ def interpolate_trains(raw, elapsed_s):
         ordered = line_stations_ord.get(line, [])
         n       = len(ordered)
 
-        if idx is None or n < 2 or tts <= 5:
+        if idx is None or n < 2 or tts <= 0:
             lat, lon = target_lat, target_lon
         else:
             towards = (t.get("towards") or "").lower()
@@ -270,14 +475,53 @@ def interpolate_trains(raw, elapsed_s):
             lat = prev["lat"] + (target["lat"] - prev["lat"]) * progress
             lon = prev["lon"] + (target["lon"] - prev["lon"]) * progress
 
+        # ── Compute bearing for directional flow ──
+        bearing = 0
+        if idx is not None and n >= 2:
+            if idx == 0:
+                a_s, b_s = ordered[0], ordered[1]
+            elif idx >= n - 1:
+                a_s, b_s = ordered[n - 2], ordered[n - 1]
+            else:
+                a_s, b_s = ordered[idx - 1], ordered[idx + 1]
+            d_lat = b_s["lat"] - a_s["lat"]
+            d_lon = b_s["lon"] - a_s["lon"]
+            bearing = math.degrees(math.atan2(d_lon, d_lat)) % 360
+            # Inbound trains travel in the opposite direction
+            if t.get("direction") == "inbound":
+                bearing = (bearing + 180) % 360
+
+        # ── Snap position onto track geometry ──
+        snapped_lon, snapped_lat = snap_to_track_line(lon, lat, line)
+
+        # ── Forward-only: prevent backward jumps between polls ──
+        train_key = t.get("trainKey", t["vehicleId"])
+        active_keys.add(train_key)
+        prev = _prev_emit.get(train_key)
+        if prev is not None:
+            p_lon, p_lat, p_nap = prev
+            if p_nap == naptan:  # same destination → must not move further away
+                old_d2 = (p_lon - target_lon) ** 2 + (p_lat - target_lat) ** 2
+                new_d2 = (snapped_lon - target_lon) ** 2 + (snapped_lat - target_lat) ** 2
+                if new_d2 > old_d2 + 1e-10:
+                    snapped_lon, snapped_lat = p_lon, p_lat
+        _prev_emit[train_key] = (snapped_lon, snapped_lat, naptan)
+
         out.append({
-            "vehicleId": t["vehicleId"], "lineName": line,
+            "vehicleId": t["vehicleId"], "trainKey": train_key,
+            "lineName": line,
             "stationName": t["stationName"],
             "direction": t.get("direction", ""),
             "towards": t.get("towards", ""),
             "timeToStation": round(tts),
-            "lat": round(lat, 6), "lon": round(lon, 6),
+            "lat": round(snapped_lat, 6), "lon": round(snapped_lon, 6),
+            "bearing": round(bearing, 1),
         })
+
+    # Clean departed trains from cache
+    for k in list(_prev_emit):
+        if k not in active_keys:
+            del _prev_emit[k]
     return out
 
 
@@ -404,7 +648,7 @@ def index():
 
 @app.route("/api/tracks")
 def api_tracks():
-    return jsonify(cached_tracks)
+    return jsonify(cached_tracks_geo)
 
 
 @app.route("/api/stations")
@@ -423,11 +667,40 @@ def api_trains():
         snap = live_data.copy()
     elapsed = time.time() - snap["fetch_epoch"] if snap["fetch_epoch"] else 0
     trains  = interpolate_trains(snap["trains"], elapsed)
+    # Per-line counts
+    line_counts = {}
+    for t in trains:
+        line_counts[t["lineName"]] = line_counts.get(t["lineName"], 0) + 1
     return jsonify({
         "trains": trains, "count": len(trains),
+        "lineCounts": line_counts,
         "fetchAge": round(elapsed, 1),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@app.route("/api/line-status")
+def api_line_status():
+    """Return TfL service status for all tube lines."""
+    try:
+        all_slugs = ",".join(LINE_SLUGS.values())
+        data = tfl_get(f"/Line/{all_slugs}/Status")
+        result = []
+        for line in data:
+            name = line.get("name", "")
+            statuses = line.get("lineStatuses", [])
+            severity = statuses[0].get("statusSeverity", 0) if statuses else 0
+            desc = statuses[0].get("statusSeverityDescription", "Unknown") if statuses else "Unknown"
+            reason = statuses[0].get("reason", "") if statuses else ""
+            result.append({
+                "lineName": name,
+                "severity": severity,
+                "status": desc,
+                "reason": reason,
+            })
+        return jsonify(result)
+    except Exception as e:
+        return jsonify([]), 500
 
 
 @app.route("/api/arrivals/<station_id>")
@@ -692,4 +965,4 @@ if __name__ == "__main__":
     print(f"  ­ƒôº  Graph API: {graph_ok}")
     print(f"{'='*56}\n")
 
-    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5050")), debug=False, threaded=True)
