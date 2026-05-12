@@ -953,7 +953,9 @@ def _bootstrap():
         print(f"   fetch failed: {e}")
         initial = []
     generate_maintenance_dataset(initial)
-    TrainRefresher(daemon=True).start()
+    t = TrainRefresher()
+    t.daemon = True
+    t.start()
 
 _bootstrap()
 
