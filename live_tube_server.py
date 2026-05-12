@@ -935,26 +935,29 @@ def create_work_order():
 
 
 # ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
-# Main
+# Bootstrap (runs at module import so it works under gunicorn too)
 # ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ
-if __name__ == "__main__":
+def _bootstrap():
     load_static_data()
-
-    print("­ƒôí Initial train fetch ÔÇª")
+    print("Initial train fetch...")
     try:
         initial = fetch_live_trains()
+        global live_data
         live_data = {
             "trains": initial,
             "fetch_epoch": time.time(),
             "count": len(initial),
         }
-        print(f"   Ô£à {len(initial)} vehicles")
+        print(f"   {len(initial)} vehicles")
     except Exception as e:
-        print(f"   ÔÜá {e}")
+        print(f"   fetch failed: {e}")
         initial = []
-
     generate_maintenance_dataset(initial)
-    TrainRefresher().start()
+    TrainRefresher(daemon=True).start()
+
+_bootstrap()
+
+if __name__ == "__main__":
 
     graph_ok = ("Ô£à" if all([GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET])
                 else "ÔÜá not configured")
